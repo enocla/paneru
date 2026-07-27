@@ -66,6 +66,8 @@ Configure trackpad gestures and scroll-wheel window sliding.
 | `sensitivity` | Float (0.1–2.0) | `0.35` | Multiplier for swipe distance. |
 | `deceleration` | Float (1.0–10.0) | `4.0` | Rate at which inertia slows down after a swipe. |
 | `continuous` | Boolean | `true` | If `true`, the windows are allowed to fully move across the desktop, potentially exposing the empty desktop space. If `false`, the window strip will not move further than the left or right most window. This also affects the windows during keyboard focus - if `false` the left or right most windows will snap to the edge of display. |
+| `discrete` | Boolean | `false` | If `true`, swiping moves focus one column at a time instead of sliding the strip. With the default `direction = "Natural"`, swiping the fingers left runs `window_focus_east` and swiping right runs `window_focus_west` — the same sense as continuous sliding. `direction = "Reversed"` swaps them. Applies to both trackpad gestures and `[swipe.scroll]` modifier scrolling. Vertical gestures still switch virtual workspaces. |
+| `discrete_threshold` | Float (0.01–2.0) | `0.15` | Accumulated swipe distance required for one focus step when `discrete = true`. The units are the raw gesture delta — fractions of trackpad travel summed across fingers, so three fingers each moving 5% of the trackpad contribute 0.15. The value is divided by `sensitivity`, so raising sensitivity also makes discrete steps easier to trigger; at the defaults a 3-finger swipe needs roughly 14% of trackpad travel per finger. |
 
 ### `[swipe.gesture]`
 | Option | Type | Default | Description |

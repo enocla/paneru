@@ -101,7 +101,15 @@ fn swipe_gesture(
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
+    mut discrete_state: Local<DiscreteGestureState>,
 ) {
+    // Discrete mode consumes the same events but steps focus instead of
+    // sliding the strip, so it replaces the continuous path entirely.
+    if config.swipe_discrete() {
+        discrete_swipe_gesture(&mut messages, &config, &mut commands, &mut discrete_state);
+        return;
+    }
+
     let swipe_sensitivity = config.swipe_sensitivity();
     let mut total_delta = 0.0;
     let mut gesture_delta = 0.0;
@@ -109,14 +117,7 @@ fn swipe_gesture(
     let mut has_scroll_event = false;
     let mut has_gesture_event = false;
 
-    // Normalization: Touchpad deltas are typically small fractions.
-    // Scroll wheel deltas can be larger. We scale it down slightly
-    // to match the "feel" of a finger swipe.
-    const SCROLL_SCALE_UPPER: f64 = 0.15;
-    const SCROLL_SCALE_LOWER: f64 = 0.005;
-    const SCROLL_FULL_RANGE: f64 = 2.0;
-    let scroll_scale = SCROLL_SCALE_LOWER
-        + ((SCROLL_SCALE_UPPER - SCROLL_SCALE_LOWER) / SCROLL_FULL_RANGE) * swipe_sensitivity;
+    let scroll_scale = scroll_delta_scale(swipe_sensitivity);
 
     for InputEvent(event) in messages.read() {
         match event {
@@ -407,6 +408,117 @@ where
             current_offset.clamp(viewport.min.x, viewport.max.x - total_strip_width)
         },
     )
+}
+
+#[derive(Default)]
+struct DiscreteGestureState {
+    accumulated: f64,
+    last_step: Option<Instant>,
+}
+
+/// Discrete alternative to the continuous path in [`swipe_gesture`]: instead of
+/// sliding the strip, accumulate horizontal swipe/scroll distance and move focus
+/// one column per threshold crossed, as if `window_focus_west` /
+/// `window_focus_east` were pressed. Enabled with `[swipe] discrete = true`.
+#[instrument(level = Level::TRACE, skip_all)]
+fn discrete_swipe_gesture(
+    messages: &mut MessageReader<InputEvent>,
+    config: &Config,
+    commands: &mut Commands,
+    state: &mut DiscreteGestureState,
+) {
+    // Momentum events keep arriving after the fingers lift; without a cooldown a
+    // single flick would walk several columns.
+    const STEP_COOLDOWN: Duration = Duration::from_millis(120);
+
+    let sensitivity = config.swipe_sensitivity();
+    let scroll_scale = scroll_delta_scale(sensitivity);
+    let mut delta_sum = 0.0;
+    let mut has_event = false;
+
+    for InputEvent(event) in messages.read() {
+        match event {
+            Event::TouchpadDown | Event::TouchpadUp => {
+                state.accumulated = 0.0;
+            }
+            Event::Scroll { delta } => {
+                delta_sum += *delta * scroll_scale;
+                has_event = true;
+            }
+            Event::Swipe { delta, fingers }
+                if config
+                    .swipe_gesture_fingers()
+                    .is_some_and(|fingers_configured| fingers_configured == *fingers) =>
+            {
+                delta_sum += delta;
+                has_event = true;
+            }
+            _ => (),
+        }
+    }
+
+    if !has_event {
+        return;
+    }
+
+    // A direction change starts a fresh step rather than cancelling out the
+    // distance already travelled the other way.
+    if state.accumulated * delta_sum < 0.0 {
+        state.accumulated = 0.0;
+    }
+    state.accumulated += delta_sum;
+
+    let threshold = config.swipe_discrete_threshold() / sensitivity;
+    if state.accumulated.abs() < threshold {
+        return;
+    }
+    if state
+        .last_step
+        .is_some_and(|last| last.elapsed() < STEP_COOLDOWN)
+    {
+        // Swallow the distance so the burst doesn't fire the moment the
+        // cooldown expires.
+        state.accumulated = 0.0;
+        return;
+    }
+
+    let direction = swipe_focus_direction(state.accumulated, config);
+    state.accumulated = 0.0;
+    state.last_step = Some(Instant::now());
+    commands.trigger(SendMessageTrigger(Event::Command {
+        command: Command::Window(Operation::Focus(direction)),
+    }));
+}
+
+/// Maps an accumulated horizontal swipe delta to the strip direction focus
+/// should travel, honouring the configured gesture direction.
+///
+/// A positive delta means the fingers moved *left*: the deltas are built as
+/// `previous - current` in `handle_swipe`. Under `Natural` that reveals windows
+/// to the east, matching the continuous path where the same positive delta
+/// slides the strip left.
+fn swipe_focus_direction(delta: f64, config: &Config) -> Direction {
+    let fingers_travelled_towards = if delta > 0.0 {
+        Direction::West
+    } else {
+        Direction::East
+    };
+    match config.swipe_gesture_direction() {
+        SwipeGestureDirection::Natural => fingers_travelled_towards.reverse(),
+        SwipeGestureDirection::Reversed => fingers_travelled_towards,
+    }
+}
+
+/// Normalization factor bringing scroll wheel deltas into the same range as
+/// normalized touchpad finger deltas.
+fn scroll_delta_scale(sensitivity: f64) -> f64 {
+    // Touchpad deltas are typically small fractions. Scroll wheel deltas can be
+    // larger. We scale it down slightly to match the "feel" of a finger swipe.
+    const SCROLL_SCALE_UPPER: f64 = 0.15;
+    const SCROLL_SCALE_LOWER: f64 = 0.005;
+    const SCROLL_FULL_RANGE: f64 = 2.0;
+    SCROLL_SCALE_LOWER
+        + ((SCROLL_SCALE_UPPER - SCROLL_SCALE_LOWER) / SCROLL_FULL_RANGE) * sensitivity
 }
 
 #[derive(Default)]

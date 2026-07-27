@@ -9,7 +9,7 @@ use crate::config::{Config, MainOptions, WindowParams, parse_command};
 use crate::ecs::display::FloatingLayer;
 use crate::ecs::{
     ActiveWorkspaceMarker, FocusedMarker, ManualStripOffset, NativeFullscreenMarker, Position,
-    Unmanaged, layout::LayoutStrip,
+    Scrolling, Unmanaged, layout::LayoutStrip,
 };
 use crate::ecs::{RepositionMarker, SpawnWindowTrigger};
 use crate::events::Event;
@@ -359,6 +359,151 @@ fn test_scrolling() {
             assert_window_at!(world, 0, -186, TEST_MENUBAR_HEIGHT);
             assert_window_at!(world, 1, 214, TEST_MENUBAR_HEIGHT);
             assert_window_at!(world, 2, 614, TEST_MENUBAR_HEIGHT);
+        })
+        .run(commands);
+}
+
+/// Config enabling discrete swiping with a 3-finger gesture and a threshold
+/// that a single test swipe can cross.
+fn discrete_swipe_config(reversed: bool) -> Config {
+    let direction = if reversed { "Reversed" } else { "Natural" };
+    Config::try_from(
+        format!(
+            r#"
+[options]
+
+[swipe]
+discrete = true
+sensitivity = 1.0
+discrete_threshold = 0.2
+
+[swipe.gesture]
+fingers_count = 3
+direction = "{direction}"
+
+[bindings]
+"#
+        )
+        .as_str(),
+    )
+    .expect("config should parse")
+}
+
+#[test]
+fn test_discrete_swipe_moves_focus_east() {
+    // Natural direction: fingers moving left (positive delta, built as
+    // `previous - current`) walk focus East, the same as `window_focus_east`.
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Swipe {
+            delta: 0.3,
+            fingers: 3,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(discrete_swipe_config(false))
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            assert_focused!(world, 0);
+        })
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_discrete_swipe_moves_focus_west() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Swipe {
+            delta: -0.3,
+            fingers: 3,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(discrete_swipe_config(false))
+        .with_windows(3)
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_discrete_swipe_honours_reversed_direction() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::Last)),
+        },
+        Event::Swipe {
+            delta: 0.3,
+            fingers: 3,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(discrete_swipe_config(true))
+        .with_windows(3)
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 1);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_discrete_swipe_below_threshold_does_nothing() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::Window(Operation::Focus(Direction::First)),
+        },
+        Event::Swipe {
+            delta: 0.05,
+            fingers: 3,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(discrete_swipe_config(false))
+        .with_windows(3)
+        .on_iteration(2, |world, _state| {
+            assert_focused!(world, 0);
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_discrete_swipe_does_not_slide_the_strip() {
+    // In discrete mode the strip is never given a `Scrolling` component: the
+    // only movement comes from focus bringing the target column into view.
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Swipe {
+            delta: 0.3,
+            fingers: 3,
+        },
+    ];
+
+    TestHarness::new()
+        .with_config(discrete_swipe_config(false))
+        .with_windows(3)
+        .on_iteration(1, |world, _state| {
+            let mut query = world.query::<&Scrolling>();
+            assert_eq!(
+                query.iter(world).count(),
+                0,
+                "discrete swiping must not start a continuous scroll"
+            );
         })
         .run(commands);
 }

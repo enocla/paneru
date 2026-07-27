@@ -23,6 +23,17 @@ pub struct SwipeOptions {
     #[allow(dead_code)]
     pub continuous: Option<bool>,
 
+    /// Move focus one column at a time instead of sliding the strip.
+    /// Applies to both trackpad gestures and modifier scrolling. Default: false.
+    pub discrete: Option<bool>,
+
+    /// Accumulated swipe distance required for one discrete focus step, before
+    /// sensitivity scaling. Units match the raw gesture delta: fractions of
+    /// trackpad travel summed across fingers, so three fingers each moving 5%
+    /// of the trackpad contribute 0.15.
+    /// Range: 0.01–2.0. Default: 0.15.
+    pub discrete_threshold: Option<f64>,
+
     pub gesture: Option<GestureOptions>,
     pub scroll: Option<ScrollOptions>,
 }

@@ -683,6 +683,29 @@ impl Config {
             .clamp(1.0, 10.0)
     }
 
+    /// When true, swiping moves focus one column at a time instead of sliding
+    /// the strip continuously.
+    pub fn swipe_discrete(&self) -> bool {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.discrete)
+            // Default: false (continuous sliding).
+            .unwrap_or(false)
+    }
+
+    /// Accumulated raw gesture delta needed for one discrete focus step,
+    /// divided by `swipe_sensitivity` at use. Not a display-width fraction:
+    /// the units are trackpad travel summed across fingers.
+    pub fn swipe_discrete_threshold(&self) -> f64 {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.discrete_threshold)
+            .unwrap_or(0.15)
+            .clamp(0.01, 2.0)
+    }
+
     pub fn mouse_resize_modifier(&self) -> Option<Modifiers> {
         self.options().mouse_resize_modifier
     }
