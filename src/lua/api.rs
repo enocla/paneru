@@ -722,6 +722,8 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
         sensitivity: _,
         deceleration: _,
         continuous: _,
+        discrete: _,
+        discrete_threshold: _,
         gesture: _,
         scroll: _,
     } = SwipeOptions::default();
