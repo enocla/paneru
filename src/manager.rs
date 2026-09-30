@@ -40,9 +40,10 @@ use skylight::{
     SLSCopyAssociatedWindows, SLSCopyManagedDisplaySpaces, SLSCopyWindowsWithOptionsAndTags,
     SLSFindWindowAndOwner, SLSGetConnectionIDForPSN, SLSGetCurrentCursorLocation,
     SLSGetDisplayMenubarHeight, SLSGetSpaceManagementMode, SLSMainConnectionID,
-    SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIteratorAdvance,
-    SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID, SLSWindowIteratorGetTags,
-    SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows, SLSWindowQueryWindows,
+    SLSManagedDisplayGetCurrentSpace, SLSSpaceGetType, SLSWindowIsOrderedIn,
+    SLSWindowIteratorAdvance, SLSWindowIteratorGetAttributes, SLSWindowIteratorGetParentID,
+    SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
+    SLSWindowQueryWindows,
 };
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
 
@@ -168,6 +169,8 @@ pub trait WindowManagerApi: Send + Sync {
     ///
     /// `Ok(Vec<WinID>)` containing the list of window IDs, otherwise `Err(Error)`.
     fn windows_in_workspace(&self, space_id: WorkspaceId) -> Result<Vec<WinID>>;
+    /// Returns `true` when a window is no longer ordered into the window list.
+    fn window_is_unordered(&self, window_id: WinID) -> bool;
 
     /// Sends an `Event::Exit` to the event loop, signaling the application to quit.
     ///
@@ -197,6 +200,7 @@ pub struct WindowManager(pub Box<dyn WindowManagerApi>);
 pub struct WindowManagerOS {
     main_cid: ConnID,
     event_sender: EventSender,
+    resolver: app::WindowResolver,
 }
 
 impl WindowManagerOS {
@@ -213,10 +217,12 @@ impl WindowManagerOS {
     pub fn new(event_sender: EventSender) -> Self {
         let main_cid = unsafe { SLSMainConnectionID() };
         debug!("My connection id: {main_cid}");
+        let resolver = app::WindowResolver::new(event_sender.clone());
 
         Self {
             main_cid,
             event_sender,
+            resolver,
         }
     }
 
@@ -320,8 +326,13 @@ impl WindowManagerOS {
 impl WindowManagerApi for WindowManagerOS {
     fn new_application(&self, process: &dyn ProcessApi) -> Result<Application> {
         let connection = self.connection_for_process(process.psn());
-        ApplicationOS::new(connection, process, &self.event_sender)
-            .map(|app| Application::new(Box::new(app)))
+        ApplicationOS::new(
+            connection,
+            process,
+            &self.event_sender,
+            self.resolver.sender(),
+        )
+        .map(|app| Application::new(Box::new(app)))
     }
 
     /// Returns child windows of the main window.
@@ -329,7 +340,7 @@ impl WindowManagerApi for WindowManagerOS {
     fn get_associated_windows(&self, window_id: WinID) -> Vec<WinID> {
         trace!("for window {window_id}");
         let windows =
-            unsafe { CFRetained::retain(SLSCopyAssociatedWindows(self.main_cid, window_id)) };
+            unsafe { CFRetained::from_raw(SLSCopyAssociatedWindows(self.main_cid, window_id)) };
         windows.into_iter().filter_map(|id| id.as_i32()).collect()
     }
 
@@ -505,9 +516,17 @@ impl WindowManagerApi for WindowManagerOS {
         }
     }
 
-    /// Returns a list of windows in a given workspace.
+    /// Returns a list of `WinID`s for all windows in a given workspace (space).
     fn windows_in_workspace(&self, space_id: WorkspaceId) -> Result<Vec<WinID>> {
         space_window_list_for_connection(self.main_cid, &[space_id], None, true)
+    }
+
+    fn window_is_unordered(&self, window_id: WinID) -> bool {
+        let mut ordered_in = 0;
+        let ordered_status =
+            unsafe { SLSWindowIsOrderedIn(self.main_cid, window_id, &mut ordered_in) };
+
+        ordered_status == 0 && ordered_in == 0
     }
 
     fn quit(&self) -> Result<()> {
@@ -820,43 +839,47 @@ pub fn bruteforce_windows(
     // time that app starts.
     let deadline = Instant::now() + BRUTEFORCE_BUDGET;
 
-    for element_id in 0..0x7fffu64 {
-        // Every iteration is a synchronous cross-process AX round trip.
-        if window_list.is_empty() {
-            break;
-        }
-        // Checked periodically only: `Instant::now` can itself be a syscall.
-        if element_id.is_multiple_of(256) && Instant::now() >= deadline {
-            warn!(
-                "{pid}: giving up the brute-force scan at element {element_id} with {} window(s) \
-                 unresolved: {window_list:?}",
-                window_list.len()
-            );
-            break;
-        }
+    // `bruteforce_windows` runs on `AsyncComputeTaskPool` worker threads, which
+    // have no CFRunLoop to drain a thread-local `NSAutoreleasePool`.
+    objc2::rc::autoreleasepool(|_| {
+        for element_id in 0..0x7fffu64 {
+            // Every iteration is a synchronous cross-process AX round trip.
+            if window_list.is_empty() {
+                break;
+            }
+            // Checked periodically only: `Instant::now` can itself be a syscall.
+            if element_id.is_multiple_of(256) && Instant::now() >= deadline {
+                warn!(
+                    "{pid}: giving up the brute-force scan at element {element_id} with {} window(s) \
+                     unresolved: {window_list:?}",
+                    window_list.len()
+                );
+                break;
+            }
 
-        let bytes = element_id.to_ne_bytes();
-        data[0xc..0xc + bytes.len()].copy_from_slice(&bytes);
+            let bytes = element_id.to_ne_bytes();
+            data[0xc..0xc + bytes.len()].copy_from_slice(&bytes);
 
-        let Ok(element_ref) =
-            AXUIWrapper::retain(unsafe { _AXUIElementCreateWithRemoteToken(data_ref.as_ref()) })
-        else {
-            continue;
-        };
-        let Some(window_id) = try_ax_window_id(element_ref.as_ptr()) else {
-            continue;
-        };
+            let Ok(element_ref) = AXUIWrapper::from_retained(unsafe {
+                _AXUIElementCreateWithRemoteToken(data_ref.as_ref())
+            }) else {
+                continue;
+            };
+            let Some(window_id) = try_ax_window_id(element_ref.as_ptr()) else {
+                continue;
+            };
 
-        if let Some(index) = window_list.iter().position(|&id| id == window_id) {
-            window_list.remove(index);
-            debug!("Found window {window_id:?}");
-            if let Ok(window) = WindowOS::new_with_config(&element_ref, config, bundle_id)
-                .inspect_err(|err| warn!("{err}"))
-            {
-                found_windows.push(Window::new(Box::new(window)));
+            if let Some(index) = window_list.iter().position(|&id| id == window_id) {
+                window_list.remove(index);
+                debug!("Found window {window_id:?}");
+                if let Ok(window) = WindowOS::new_with_config(&element_ref, config, bundle_id)
+                    .inspect_err(|err| warn!("{err}"))
+                {
+                    found_windows.push(Window::new(Box::new(window)));
+                }
             }
         }
-    }
+    });
     found_windows
 }
 

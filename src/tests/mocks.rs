@@ -88,6 +88,10 @@ struct MockStateInner {
     /// Windows that are gone but which the app's AX window list still reports,
     /// modelling the lag real apps show right after a window closes.
     stale_window_ids: HashMap<WinID, Pid>,
+    unordered_windows: HashSet<WinID>,
+    /// Windows the app keeps out of its accessibility window list while the
+    /// window server still reports them on screen: a background native tab.
+    background_tabs: HashSet<WinID>,
 }
 
 #[derive(Clone)]
@@ -107,7 +111,32 @@ impl MockState {
                 cursor_position: Origin::ZERO,
                 event_queue: VecDeque::new(),
                 stale_window_ids: HashMap::new(),
+                unordered_windows: HashSet::new(),
+                background_tabs: HashSet::new(),
             })),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_window_unordered(&self, window_id: WinID, unordered: bool) {
+        let mut inner = self.inner.force_write();
+        if unordered {
+            inner.unordered_windows.insert(window_id);
+        } else {
+            inner.unordered_windows.remove(&window_id);
+        }
+    }
+
+    /// Makes `window_id` a background native tab: on screen as far as the
+    /// window server is concerned, absent from the app's accessibility window
+    /// list. This is what Ghostty does with every tab but the selected one.
+    #[allow(unused)]
+    pub fn set_background_tab(&self, window_id: WinID, background: bool) {
+        let mut inner = self.inner.force_write();
+        if background {
+            inner.background_tabs.insert(window_id);
+        } else {
+            inner.background_tabs.remove(&window_id);
         }
     }
 
@@ -332,7 +361,9 @@ impl MockState {
     /// closed while paneru was not running.
     #[allow(unused)]
     pub fn os_vanish_window(&self, id: WinID) {
-        self.inner.force_write().windows.remove(&id);
+        let mut inner = self.inner.force_write();
+        inner.windows.remove(&id);
+        inner.unordered_windows.insert(id);
     }
 
     /// Lets the app's window list catch up with reality after a close.
@@ -485,12 +516,12 @@ impl MockState {
 
         let s = self.clone();
         mw.expect_role().returning(move || {
-            Ok(s.inner
+            s.inner
                 .force_read()
                 .windows
                 .get(&id)
                 .map(|w| w.role.clone())
-                .unwrap_or_default())
+                .ok_or_else(|| crate::errors::Error::Generic(format!("window {id} not found")))
         });
 
         let s = self.clone();
@@ -661,11 +692,27 @@ impl MockState {
         ma.expect_window_list()
             .returning(move |_| ids().into_iter().map(|id| s.create_window(id)).collect());
 
+        let (s, ids) = (self.clone(), window_ids.clone());
+        ma.expect_ax_window_ids().returning(move || {
+            let background = s.inner.force_read().background_tabs.clone();
+            ids()
+                .into_iter()
+                .filter(|id| !background.contains(id))
+                .collect()
+        });
+
         Application::new(Box::new(ma))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn create_window_manager(&self) -> MockWindowManagerApi {
         let mut wm = MockWindowManagerApi::new();
+
+        let s = self.clone();
+        wm.expect_window_is_unordered().returning(move |window_id| {
+            let inner = s.inner.force_read();
+            inner.unordered_windows.contains(&window_id) || !inner.windows.contains_key(&window_id)
+        });
 
         let s = self.clone();
         wm.expect_active_display_id()

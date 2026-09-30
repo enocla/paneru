@@ -904,6 +904,161 @@ fn test_focus_recovers_when_focused_window_is_outside_strip() {
         .run(commands);
 }
 
+/// A background native tab that ended up with a column of its own is folded
+/// back into the column of the tab that is showing, so the strip stops holding
+/// a slot nothing can ever appear in.
+#[test]
+fn test_stray_background_tab_is_folded_into_the_visible_tab() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    use crate::ecs::{Bounds, Position};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    for _ in 0..3 {
+        harness.app.update();
+    }
+
+    // Window 1 is a background tab of window 0: same app, same frame, and the
+    // window server does not report it on screen.
+    harness.mock_state.update_window(1, |window| {
+        window.visible = false;
+    });
+
+    let world = harness.app.world_mut();
+    let leader = find_window_entity(0, world);
+    let background = find_window_entity(1, world);
+    let position = world.get::<Position>(leader).expect("a position").clone();
+    let bounds = world.get::<Bounds>(leader).expect("bounds").clone();
+    world.entity_mut(background).insert((position, bounds));
+
+    {
+        let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+        let strip = strips.single(world).expect("one active strip");
+        assert_eq!(strip.len(), 2, "the tabs start out in columns of their own");
+    }
+
+    world
+        .run_system_once(crate::ecs::systems::regroup_stray_native_tabs)
+        .expect("the regrouping system runs");
+
+    let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+    let strip = strips.single(world).expect("one active strip");
+    assert_eq!(strip.len(), 1, "the stray column is gone");
+    assert!(strip.tabbed(background), "the background tab is a tab now");
+    assert!(strip.tabbed(leader));
+}
+
+/// Ghostty keeps every background tab in the window server's on-screen list,
+/// so "not on screen" never becomes true and the fold above cannot fire. What
+/// it does do is drop the background tab from its accessibility window list,
+/// which is the signal this leans on instead.
+#[test]
+fn test_on_screen_background_tab_is_folded_into_the_visible_tab() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    use crate::ecs::{Bounds, Position};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    for _ in 0..3 {
+        harness.app.update();
+    }
+
+    // Both windows stay on screen, exactly as the window server reports a
+    // Ghostty tab group. Only the app's accessibility list tells them apart.
+    harness.mock_state.set_background_tab(1, true);
+
+    let world = harness.app.world_mut();
+    let leader = find_window_entity(0, world);
+    let background = find_window_entity(1, world);
+    let position = world.get::<Position>(leader).expect("a position").clone();
+    let bounds = world.get::<Bounds>(leader).expect("bounds").clone();
+    world.entity_mut(background).insert((position, bounds));
+
+    {
+        let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+        let strip = strips.single(world).expect("one active strip");
+        assert_eq!(strip.len(), 2, "the tabs start out in columns of their own");
+    }
+
+    world
+        .run_system_once(crate::ecs::systems::regroup_stray_native_tabs)
+        .expect("the regrouping system runs");
+
+    let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+    let strip = strips.single(world).expect("one active strip");
+    assert_eq!(strip.len(), 1, "the stray column is gone");
+    assert!(strip.tabbed(background), "the background tab is a tab now");
+    assert!(strip.tabbed(leader));
+}
+
+/// An app that does not answer an accessibility window list query must not be
+/// read as showing nothing: every window of that app would fold into one
+/// column.
+#[test]
+fn test_silent_accessibility_list_does_not_fold_visible_windows() {
+    use bevy::ecs::system::RunSystemOnce as _;
+
+    use crate::ecs::{Bounds, Position};
+
+    let mut harness = TestHarness::new().with_windows(2);
+    for _ in 0..3 {
+        harness.app.update();
+    }
+
+    harness.mock_state.set_background_tab(0, true);
+    harness.mock_state.set_background_tab(1, true);
+
+    let world = harness.app.world_mut();
+    let leader = find_window_entity(0, world);
+    let other = find_window_entity(1, world);
+    let position = world.get::<Position>(leader).expect("a position").clone();
+    let bounds = world.get::<Bounds>(leader).expect("bounds").clone();
+    world.entity_mut(other).insert((position, bounds));
+
+    world
+        .run_system_once(crate::ecs::systems::regroup_stray_native_tabs)
+        .expect("the regrouping system runs");
+
+    let mut strips = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
+    let strip = strips.single(world).expect("one active strip");
+    assert_eq!(strip.len(), 2, "both windows keep their own column");
+}
+
+/// An app with native tabs answers "which window is focused?" with whichever
+/// member of the tab group it decided to show, so the id on a focus event can
+/// already be out of date. Paneru has to follow the app to that window; drop
+/// the event and the strip stays parked where it was, which is what makes
+/// Cmd-Tab into a tabbed terminal look like nothing happened.
+#[test]
+fn test_focus_event_follows_the_window_the_app_says_is_focused() {
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+        Event::WindowFocused { window_id: 0 },
+        Event::Command {
+            command: Command::PrintState,
+        },
+    ];
+
+    TestHarness::new()
+        .with_windows(2)
+        .on_iteration(1, |world, state| {
+            assert_eq!(focused_window_id(world), 0);
+            // The app has moved on to its other window without telling us.
+            state.set_focused_window(1);
+        })
+        .on_iteration(3, |world, _state| {
+            assert_eq!(
+                focused_window_id(world),
+                1,
+                "the focus event must follow the app to the window it actually focused",
+            );
+        })
+        .run(commands);
+}
+
 #[test]
 fn test_focus_west_from_outside_strip_enters_at_last_column() {
     let commands = vec![
@@ -1574,6 +1729,311 @@ fn test_virtual_workspace_switch_no_horizontal_slide_no_animations() {
         strip_x_final, strip_x_after_scroll,
         "strip x must equal the pre-switch scroll position after VW switch-back (no sideways slide). \
          Expected {strip_x_after_scroll}, got {strip_x_final}"
+    );
+}
+
+/// Regression: `show_active_workspace` defers the "expose the arriving
+/// focus window" correction to `ensure_visible_in_strip` because that
+/// system's own `is_added(ActiveWorkspaceMarker)` guard would otherwise skip
+/// it on the very tick it's needed. By the time it actually runs (one tick
+/// later), `is_added` is no longer true, so without the `snap` flag it fell
+/// back to always animating — sliding the whole strip (everything in it,
+/// stacked or not) into place even with `virtual_workspace_animations =
+/// false`. This exercises `ensure_visible_in_strip` directly (via the same
+/// `EnsureVisibleMarker { snap }` `show_active_workspace` inserts) rather
+/// than reproducing the full VW-restore choreography, since only that one
+/// system's snap-vs-animate decision is under test here.
+#[test]
+fn test_ensure_visible_snap_does_not_animate_with_animations_off() {
+    let config: Config = (
+        MainOptions {
+            virtual_workspace_animations: Some(false),
+            animation_speed: Some(12.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    // 5 windows @ 400px = 2000px strip on a 1024px display → scrollable, so
+    // window 4 sits off the right edge at scroll position 0.
+    let mut h = TestHarness::new().with_config(config).with_windows(5);
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::PrintState,
+    });
+    for _ in 0..8 {
+        h.app.update();
+        for e in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(e);
+        }
+    }
+
+    let off_screen_window = find_window_entity(4, h.app.world_mut());
+    h.app
+        .world_mut()
+        .entity_mut(off_screen_window)
+        .insert(crate::ecs::EnsureVisibleMarker { snap: true });
+
+    for step in 0..10 {
+        h.app.update();
+        for e in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(e);
+        }
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, (With<LayoutStrip>, With<RepositionMarker>)>();
+        assert!(
+            q.iter(world).next().is_none(),
+            "step {step}: strip must never animate when EnsureVisibleMarker::snap is true \
+             and virtual_workspace_animations is false"
+        );
+    }
+
+    let world = h.app.world_mut();
+    let mut q = world.query_filtered::<&Position, With<ActiveWorkspaceMarker>>();
+    let strip_x = q.single(world).expect("exactly one active strip").0.x;
+    assert_ne!(
+        strip_x, 0,
+        "test setup: the strip must actually have scrolled to expose window 4"
+    );
+}
+
+/// Companion regression: the *ordinary* (non-restore) `ensure_visible` path
+/// — the one every other caller uses — must keep animating exactly as
+/// before. This is the guard against a fix for the case above accidentally
+/// making every scroll-to-reveal instant.
+#[test]
+fn test_ensure_visible_without_snap_still_animates() {
+    let config: Config = (
+        MainOptions {
+            virtual_workspace_animations: Some(false),
+            animation_speed: Some(0.5),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut h = TestHarness::new().with_config(config).with_windows(5);
+    h.app.world_mut().write_message::<Event>(Event::Command {
+        command: Command::PrintState,
+    });
+    for _ in 0..8 {
+        h.app.update();
+        for e in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(e);
+        }
+    }
+
+    let off_screen_window = find_window_entity(4, h.app.world_mut());
+    h.app
+        .world_mut()
+        .entity_mut(off_screen_window)
+        .insert(crate::ecs::EnsureVisibleMarker { snap: false });
+
+    h.app.update();
+    for e in h.mock_state.drain_events() {
+        h.app.world_mut().write_message::<Event>(e);
+    }
+
+    let world = h.app.world_mut();
+    let mut q = world.query_filtered::<Entity, (With<LayoutStrip>, With<RepositionMarker>)>();
+    assert!(
+        q.iter(world).next().is_some(),
+        "an ordinary (non-restore) ensure_visible correction must still animate, \
+         regardless of virtual_workspace_animations"
+    );
+}
+
+/// Regression: `position_layout_windows`'s offscreen/parking magnitude
+/// heuristic has no way to know a virtual-workspace restore is in progress.
+/// A member window whose last position differs from its recomputed target
+/// by less than the "offscreen" distance (and isn't at the parked corner
+/// either) gets animated by the ordinary layout-change path even with
+/// `virtual_workspace_animations = false`, because nothing about the move
+/// looks large enough to be restore-driven. This happens for real: a lower
+/// stack member parked while its strip was hidden can land at a Y just
+/// under both thresholds. `SnapStripMarker` closes the gap by naming the
+/// strip explicitly, rather than inferring "was this restore-driven?" from
+/// move magnitude. Reproduces the mechanism directly (perturb + retrigger),
+/// since replicating the exact real-world "parked just under threshold"
+/// numbers through natural VW-switch parking isn't reliable in the mock
+/// harness.
+#[test]
+fn test_snap_strip_marker_forces_snap_for_under_threshold_move() {
+    let config: Config = (
+        MainOptions {
+            virtual_workspace_animations: Some(false),
+            animation_speed: Some(12.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    let pump = |h: &mut TestHarness, c: Command| {
+        h.app
+            .world_mut()
+            .write_message::<Event>(Event::Command { command: c });
+        for _ in 0..8 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+
+    pump(&mut h, Command::PrintState);
+    pump(&mut h, Command::Window(Operation::Focus(Direction::East)));
+    pump(&mut h, Command::Window(Operation::Stack(true)));
+    // Let the stack's own build-out animation fully settle before
+    // perturbing anything, so the "before" position is a true resting
+    // state, not a value still mid-transit.
+    for _ in 0..20 {
+        h.app.update();
+        for e in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(e);
+        }
+    }
+
+    let stack_member = find_window_entity(1, h.app.world_mut());
+    let strip_entity = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip")
+    };
+    assert!(
+        h.app
+            .world_mut()
+            .get::<RepositionMarker>(stack_member)
+            .is_none(),
+        "test setup: the stack must have fully settled before perturbing it"
+    );
+
+    // Perturb the stack member well under both the parking threshold and
+    // the 80%-of-viewport "offscreen" distance (748 * 0.8 ~= 598 in this
+    // harness), spawn the guard, then re-touch the strip's own Position -
+    // the same trigger `show_active_workspace` uses on a restore.
+    h.app
+        .world_mut()
+        .get_mut::<Position>(stack_member)
+        .expect("stack member has a Position")
+        .0
+        .y -= 300;
+    h.app
+        .world_mut()
+        .spawn(crate::ecs::workspace::SnapStripMarker {
+            strip: strip_entity,
+        });
+    h.app
+        .world_mut()
+        .get_mut::<Position>(strip_entity)
+        .expect("strip has a Position")
+        .set_changed();
+
+    for _ in 0..5 {
+        h.app.update();
+        for e in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(e);
+        }
+    }
+
+    assert!(
+        h.app
+            .world_mut()
+            .get::<RepositionMarker>(stack_member)
+            .is_none(),
+        "a strip named by a live SnapStripMarker must snap its members directly, not animate"
+    );
+}
+
+/// Companion regression: the same under-threshold perturbation, without a
+/// `SnapStripMarker`, must still animate exactly as before — the guard from
+/// the test above is name-scoped to the strip, not a blanket behavior
+/// change to `position_layout_windows`.
+#[test]
+fn test_under_threshold_move_animates_without_snap_strip_marker() {
+    let config: Config = (
+        MainOptions {
+            virtual_workspace_animations: Some(false),
+            animation_speed: Some(12.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+
+    let mut h = TestHarness::new().with_config(config).with_windows(3);
+    let pump = |h: &mut TestHarness, c: Command| {
+        h.app
+            .world_mut()
+            .write_message::<Event>(Event::Command { command: c });
+        for _ in 0..8 {
+            h.app.update();
+            for e in h.mock_state.drain_events() {
+                h.app.world_mut().write_message::<Event>(e);
+            }
+        }
+    };
+
+    pump(&mut h, Command::PrintState);
+    pump(&mut h, Command::Window(Operation::Focus(Direction::East)));
+    pump(&mut h, Command::Window(Operation::Stack(true)));
+    // Let the stack's own build-out animation fully settle before
+    // perturbing anything, so the "before" position is a true resting
+    // state, not a value still mid-transit.
+    for _ in 0..20 {
+        h.app.update();
+        for e in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(e);
+        }
+    }
+
+    let stack_member = find_window_entity(1, h.app.world_mut());
+    let strip_entity = {
+        let world = h.app.world_mut();
+        let mut q = world.query_filtered::<Entity, With<ActiveWorkspaceMarker>>();
+        q.single(world).expect("exactly one active strip")
+    };
+    assert!(
+        h.app
+            .world_mut()
+            .get::<RepositionMarker>(stack_member)
+            .is_none(),
+        "test setup: the stack must have fully settled before perturbing it"
+    );
+
+    h.app
+        .world_mut()
+        .get_mut::<Position>(stack_member)
+        .expect("stack member has a Position")
+        .0
+        .y -= 300;
+    h.app
+        .world_mut()
+        .get_mut::<Position>(strip_entity)
+        .expect("strip has a Position")
+        .set_changed();
+
+    let mut saw_reposition_marker = false;
+    for _ in 0..5 {
+        h.app.update();
+        for e in h.mock_state.drain_events() {
+            h.app.world_mut().write_message::<Event>(e);
+        }
+        if h.app
+            .world_mut()
+            .get::<RepositionMarker>(stack_member)
+            .is_some()
+        {
+            saw_reposition_marker = true;
+            break;
+        }
+    }
+
+    assert!(
+        saw_reposition_marker,
+        "without a SnapStripMarker, the under-threshold move must still animate"
     );
 }
 

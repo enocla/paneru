@@ -1,6 +1,6 @@
 [package]
 name = "paneru"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.95.0"
 description = "A sliding, tiling window manager for MacOS."
@@ -21,12 +21,12 @@ default-members = ["."]
 [workspace.dependencies]
 cfg-if = "1.0.4"
 futures-lite = "2.6"
-mach2 = "0.7"
+async-mach-ports = "0.3"
+rmp-serde = "1.2"
 mlua = { version = "0.12", default-features = false, features = ["serialize"] }
 paneru-lua = { path = "crates/lua" }
-paneru-mach-ipc = { path = "crates/mach_ipc" }
 paneru-shared-types = { path = "crates/shared_types" }
-regex = "1.12"
+regex = "1.13"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 
@@ -142,7 +142,6 @@ objc2-app-kit = { version = "0.3", features = [
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFRunLoop"] }
 objc2-core-graphics = "0.3"
-paneru-mach-ipc = { workspace = true }
 paneru-shared-types = { workspace = true }
 paneru-lua = { workspace = true, optional = true }
 objc2-quartz-core = { version = "0.3", features = [
@@ -170,5 +169,3 @@ xdg = "3.0"
 mockall = "0.15"
 [build-dependencies]
 cfg-if = { workspace = true}
-
-

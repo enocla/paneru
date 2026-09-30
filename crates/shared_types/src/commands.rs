@@ -242,11 +242,23 @@ pub enum Operation {
     Manage,
     /// Stacks or unstacks a window. The boolean indicates whether to stack (`true`) or unstack (`false`).
     Stack(bool),
+    /// Toggles the focused window's stack between a normal split display
+    /// (all windows visible, sharing height) and a tabbed display (one
+    /// window visible at a time, sharing the full column). Cycle tabs with
+    /// the existing `Focus` North/South directions.
+    ToggleTabbedDisplay,
     /// Resizes and repositions the focused window to fit within the visible viewport
     /// (including edge padding).
     Snap,
     /// Cyclically selects the virtual strip for the current workspace.
     Virtual(Direction),
+    /// North/South only: focuses a stack neighbor above/below the focused
+    /// window if one exists (the same within-column traversal as `Focus`),
+    /// otherwise cyclically selects the virtual strip like `Virtual` would.
+    /// A distinct command from `Virtual` so a plain virtual-workspace-switch
+    /// binding keeps meaning exactly that, unconditionally. A no-op on any
+    /// other direction.
+    FocusOrVirtual(Direction),
     /// Selects a virtual strip by its zero-based index for the current workspace.
     VirtualNumber(u32),
     /// Creates a new empty virtual strip after the highest existing one for

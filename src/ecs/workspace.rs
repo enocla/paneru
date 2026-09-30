@@ -16,19 +16,21 @@ use std::time::Duration;
 use tracing::{Level, debug, error, instrument, warn};
 
 use super::{ActiveDisplayMarker, SpawnWindowTrigger};
-use crate::commands::{Direction, MoveFocus, Operation, filter_window_operations};
+use crate::commands::{
+    Direction, MoveFocus, Operation, filter_window_operations, get_window_in_direction,
+};
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER, origin_exposing};
 use crate::ecs::params::{ActiveDisplay, WindowCtx, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, DockPosition, FocusedMarker, Initializing, ManualStripOffset,
-    NativeFullscreenMarker, Position, RaiseWindow, RefreshWindowSizes, RepositionMarker, Scrolling,
-    SelectedVirtualMarker, SpawnCommandsExt, Timeout, Unmanaged,
+    NativeFullscreenMarker, Position, RaiseWindow, RepositionMarker, Scrolling,
+    SelectedVirtualMarker, SendMessageTrigger, SpawnCommandsExt, Timeout, Unmanaged,
 };
 use crate::errors::Result;
-use crate::events::Event;
-use crate::manager::{Application, Display, Origin, Size, Window, WindowManager};
+use crate::events::{DestroySource, Event};
+use crate::manager::{Application, Display, Origin, Window, WindowManager};
 use crate::platform::{WinID, WorkspaceId};
 
 pub struct WorkspaceEventsPlugin;
@@ -78,8 +80,7 @@ type RenumberStrips<'w, 's> = ParamSet<
 
 impl Plugin for WorkspaceEventsPlugin {
     fn build(&self, app: &mut App) {
-        const REFRESH_WINDOW_CHECK_FREQ_MS: u64 = 1000;
-        const DISPLAY_CHANGE_CHECK_FREQ_MS: u64 = 1000;
+        const DISPLAY_CHANGE_CHECK_FREQ: Duration = Duration::from_secs(1);
 
         let reap_workspaces = |config: Option<Res<Config>>| {
             config.is_some_and(|config| config.reap_empty_workspaces())
@@ -99,14 +100,9 @@ impl Plugin for WorkspaceEventsPlugin {
                 show_active_workspace,
                 handle_virtual_window_moves,
                 detect_moved_windows.run_if(not(resource_exists::<Initializing>)),
-                refresh_workspace_window_sizes.run_if(on_timer(Duration::from_millis(
-                    REFRESH_WINDOW_CHECK_FREQ_MS,
-                ))),
                 find_orphaned_workspaces
                     .after(crate::ecs::display::reconcile_displays)
-                    .run_if(on_timer(Duration::from_millis(
-                        DISPLAY_CHANGE_CHECK_FREQ_MS,
-                    ))),
+                    .run_if(on_timer(DISPLAY_CHANGE_CHECK_FREQ)),
             ),
         );
         app.add_systems(PostUpdate, workspace_destroyed_handler);
@@ -148,6 +144,35 @@ const RESTORE_FOCUS_GUARD_TIMEOUT: Duration = Duration::from_secs(2);
 fn spawn_restore_focus_guard(entity: Entity, commands: &mut Commands) {
     let timeout = Timeout::new(RESTORE_FOCUS_GUARD_TIMEOUT, None, commands);
     commands.spawn((timeout, RestoreFocusMarker { entity }));
+}
+
+/// Guard spawned when `show_active_workspace` writes a restored strip's
+/// `Position` directly (`virtual_workspace_animations = false`). That write
+/// only fixes the strip's own aggregate offset instantly; individual member
+/// windows still get re-evaluated by `position_layout_windows` on a
+/// following tick (via `position_layout_strips` reacting to the strip's now
+/// -`Changed<Position>`), using whatever `Position` they were last left at —
+/// which, for a lower stack member parked while its strip was hidden, can
+/// land close enough to its restored target that neither the "offscreen
+/// distance" nor the "parked at the corner" heuristic recognizes it as a
+/// restore-driven move. Left to the ordinary heuristic, that move animates,
+/// riding along even though the strip itself just snapped. While a live
+/// guard names a strip, `position_layout_windows` snaps every member
+/// window directly, bypassing that heuristic entirely. Expires via
+/// `timeout_ticker` like `RestoreFocusMarker`.
+#[derive(Component, Debug)]
+pub(crate) struct SnapStripMarker {
+    pub strip: Entity,
+}
+
+/// Long enough for the settle described above to actually finish (it can
+/// take more than one tick), short enough that an ordinary layout change
+/// shortly after a switch still animates normally.
+const SNAP_STRIP_GUARD_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn spawn_snap_strip_guard(strip: Entity, commands: &mut Commands) {
+    let timeout = Timeout::new(SNAP_STRIP_GUARD_TIMEOUT, None, commands);
+    commands.spawn((timeout, SnapStripMarker { strip }));
 }
 
 fn fullscreen_window_in_strip(
@@ -498,7 +523,6 @@ fn find_orphaned_workspaces(
             // Was reparented, remove timer.
             if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
                 cmd.try_remove::<Timeout>();
-                cmd.insert(RefreshWindowSizes::default());
             }
             debug!(
                 "layout strip {} was re-parented, removing timeout.",
@@ -539,76 +563,36 @@ fn find_orphaned_workspaces(
         );
 
         if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
-            cmd.try_remove::<Timeout>()
-                .insert(ChildOf(target_entity))
-                .insert(RefreshWindowSizes::default());
+            cmd.try_remove::<Timeout>().insert(ChildOf(target_entity));
         }
     }
 }
 
-fn refresh_workspace_window_sizes(
-    layout_strip: Populated<(&RefreshWindowSizes, &LayoutStrip, Entity, &ChildOf)>,
-    mut windows: Query<(Entity, &mut Window, Option<&Unmanaged>)>,
-    displays: Query<(&Display, Option<&DockPosition>)>,
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn cleanup_unordered_windows(
+    windows: Query<&Window>,
+    workspaces: Query<&LayoutStrip>,
     window_manager: Res<WindowManager>,
-    config: Res<Config>,
     mut commands: Commands,
 ) {
-    for (_, strip, strip_entity, child) in
-        layout_strip.into_iter().filter(|marker| marker.0.ready())
-    {
-        debug!("refreshing workspace {} sizes", strip.id());
-        let Ok((display, dock)) = displays.get(child.parent()) else {
-            continue;
-        };
-        let viewport = display.actual_display_bounds(dock, &config);
+    let windows = workspaces
+        .iter()
+        .flat_map(|strip| {
+            strip
+                .all_windows()
+                .into_iter()
+                .filter(|entity| !strip.tabbed(*entity))
+        })
+        .filter_map(|entity| windows.get(entity).ok());
 
-        let mut in_workspace = window_manager
-            .windows_in_workspace(strip.id())
-            .inspect_err(|err| {
-                warn!("getting windows in workspace: {err}");
-            })
-            .unwrap_or_default();
-
-        // Resize windows for the new display dimensions.
-        for entity in strip.all_windows() {
-            let Ok((_, ref mut window, _)) = windows.get_mut(entity) else {
-                continue;
-            };
-            let Ok(frame) = window.update_frame() else {
-                continue;
-            };
-            let clamped_size = Size::new(
-                frame.width().clamp(0, viewport.width()),
-                frame.height().clamp(0, viewport.height()),
-            );
-            debug!("resizing window {} size to {clamped_size}", window.id());
-            commands.resize_entity(entity, clamped_size);
-
-            in_workspace.retain(|window_id| *window_id != window.id());
-        }
-
-        // Find remaining windows which are outside of the strip.                                                  ...
-        let floating = in_workspace
-            .into_iter()
-            .filter_map(|window_id| {
-                windows
-                    .iter()
-                    .find_map(|(entity, window, unmanaged)| {
-                        (window_id == window.id()).then_some(unmanaged.zip(Some(entity)))
-                    })
-                    .flatten()
-            })
-            .filter_map(|(unmanaged, entity)| {
-                matches!(unmanaged, Unmanaged::Floating).then_some(entity)
-            });
-        for window_entity in floating {
-            debug!("repositioning floating window {window_entity}");
-            commands.reposition_entity(window_entity, viewport.min);
-        }
-
-        if let Ok(mut cmds) = commands.get_entity(strip_entity) {
-            cmds.try_remove::<RefreshWindowSizes>();
+    for window in windows {
+        let window_id = window.id();
+        if window_manager.window_is_unordered(window_id) && window.role().is_err() {
+            debug!("Window {window_id} is unordered; removing it.");
+            commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
+                window_id,
+                source: DestroySource::Accessibility,
+            }));
         }
     }
 }
@@ -885,6 +869,7 @@ fn mid_strip_slot(
 #[instrument(level = Level::DEBUG, skip_all)]
 fn switch_virtual_workspace_bind(
     mut messages: MessageReader<Event>,
+    windows: Windows,
     active_display: ActiveDisplay,
     workspaces: Query<(Entity, &LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     config: Res<Config>,
@@ -893,11 +878,46 @@ fn switch_virtual_workspace_bind(
     let Some(operation) = filter_window_operations(&mut messages, |op| {
         matches!(
             op,
-            Operation::Virtual(_) | Operation::VirtualNumber(_) | Operation::VirtualAdd
+            Operation::Virtual(_)
+                | Operation::VirtualNumber(_)
+                | Operation::VirtualAdd
+                | Operation::FocusOrVirtual(_)
         )
     })
     .next() else {
         return;
+    };
+
+    // `FocusOrVirtual` is a distinct command from `Operation::Virtual` on
+    // purpose: `window_virtual_north/south` must keep meaning exactly
+    // "switch the virtual workspace", unconditionally, for anyone who binds
+    // it that way — this new command is for callers who explicitly want
+    // "focus a stack neighbor above/below first, and only switch workspace
+    // once there's nothing left to focus", the same within-column traversal
+    // `window_focus_north/south` uses. Only North/South are meaningful here
+    // (there's no "focus" reading of East/West/First/Last/Nth to pair with
+    // a workspace switch); anything else is a no-op. Once the focus check
+    // doesn't apply, this reduces to a plain `Operation::Virtual(direction)`
+    // and falls through to the exact same switching logic below.
+    let synthesized_virtual;
+    let operation = match operation {
+        Operation::FocusOrVirtual(direction @ (Direction::North | Direction::South)) => {
+            if let Some((_, focused_entity)) = windows.focused()
+                && let Some(target) = get_window_in_direction(
+                    direction,
+                    focused_entity,
+                    active_display.active_strip(),
+                )
+            {
+                commands.focus_entity(target, true);
+                commands.reshuffle_around(target);
+                return;
+            }
+            synthesized_virtual = Operation::Virtual(direction.clone());
+            &synthesized_virtual
+        }
+        Operation::FocusOrVirtual(_) => return,
+        operation => operation,
     };
 
     let workspace_id = active_display.active_strip().id();
@@ -1219,6 +1239,12 @@ pub(crate) fn show_active_workspace(
             commands.reposition_entity(*activated, origin);
         } else {
             position.0 = origin;
+            // The strip's own offset is fixed instantly, but member windows
+            // (a lower stack member especially) can still need a correction
+            // on a following tick that the ordinary offscreen/parking
+            // heuristic in `position_layout_windows` won't recognize as
+            // restore-driven — see `SnapStripMarker`.
+            spawn_snap_strip_guard(*activated, &mut commands);
         }
 
         if keeps_focus {
@@ -1226,9 +1252,14 @@ pub(crate) fn show_active_workspace(
             // settle over the next frames (widths recomputed, windows the
             // workspace picked up while it was hidden). Re-check the arriving
             // window then: `ensure_visible_in_strip` only scrolls if the slot
-            // it ends up in really falls off an edge.
+            // it ends up in really falls off an edge. That correction fires a
+            // tick after this one (its own `is_added` guard skips the
+            // activation tick), so it must snap rather than animate when
+            // `virtual_workspace_animations` is off — otherwise the strip
+            // (and everything in it) visibly slides on top of the restore
+            // this function just did instantly.
             if let Some(focus_entity) = arriving_focus {
-                commands.ensure_visible(focus_entity);
+                commands.ensure_visible_snap(focus_entity, !config.virtual_workspace_animations());
             }
             return;
         }

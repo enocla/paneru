@@ -755,6 +755,15 @@ impl Config {
             .and_then(|scroll| scroll.vertical_modifier)
     }
 
+    pub fn swipe_scroll_window_step(&self) -> bool {
+        self.inner()
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.scroll.as_ref())
+            .and_then(|scroll| scroll.window_step)
+            .unwrap_or(false)
+    }
+
     pub fn window_dim_ratio(&self, is_dark: bool) -> Option<f32> {
         let config = self.inner();
         if config
@@ -900,8 +909,15 @@ impl Config {
             .and_then(|menubar| menubar.colors.as_ref())
             .into_iter()
             .flatten()
-            .map(|hex_string| parse_hex_color(hex_string))
+            .map(|hex_string| resolve_menubar_color(hex_string))
             .collect()
+    }
+    /// True when at least one menubar colour is an explicit hex stop rather than
+    /// the empty-string system-appearance sentinel.
+    pub fn menubar_has_external_gradient(&self) -> bool {
+        self.menubar_gradient()
+            .iter()
+            .any(|(red, _, _)| !red.is_nan())
     }
     pub fn menubar_gradient_angle(&self) -> f64 {
         self.inner()
@@ -988,6 +1004,14 @@ impl Config {
             .and_then(|indicator| indicator.inactive_character)
             .unwrap_or('○')
     }
+}
+
+fn resolve_menubar_color(hex: &str) -> (f64, f64, f64) {
+    let check_string = hex.is_empty();
+    if !check_string {
+        return parse_hex_color(hex);
+    }
+    (f64::NAN, f64::NAN, f64::NAN)
 }
 
 fn parse_hex_color(hex: &str) -> (f64, f64, f64) {
@@ -1160,12 +1184,14 @@ impl InnerConfig {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[cfg_attr(test, derive(serde::Serialize))]
 #[serde(rename_all = "snake_case")]
 pub enum MissingWindowBehavior {
     Ignore,
 }
 
 #[derive(Clone, Debug, Deserialize, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct RestoreOptions {
     pub enabled: Option<bool>,
     pub startup_grace_ms: Option<u64>,
@@ -1175,6 +1201,7 @@ pub struct RestoreOptions {
 /// `MainOptions` represents the primary configuration options for the window manager.
 /// These options control various behaviors such as mouse focus, gesture recognition, and window animation.
 #[derive(Deserialize, Clone, Debug, Default)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub struct MainOptions {
     /// Enables or disables focus follows mouse behavior.
     pub focus_follows_mouse: Option<bool>,
@@ -1234,6 +1261,7 @@ pub struct MainOptions {
     pub swipe_deceleration: Option<f64>,
     /// The modifier key used for mouse-based window resizing.
     #[serde(default, deserialize_with = "deserialize_modifier")]
+    #[cfg_attr(test, serde(serialize_with = "serialize_modifier"))]
     pub mouse_resize_modifier: Option<Modifiers>,
     /// Override the system menubar height (in pixels).
     /// When set, this value is used instead of the height reported by macOS.
@@ -1433,6 +1461,42 @@ where
     parse_modifiers(&s)
         .map(Some)
         .map_err(|e: Error| serde::de::Error::custom(e.to_string()))
+}
+
+#[cfg(test)]
+#[allow(clippy::ref_option, clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn serialize_modifier<S: serde::Serializer>(
+    val: &Option<Modifiers>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_some(&val.as_ref().map(Modifiers::bits))
+}
+
+#[cfg(feature = "lua")]
+pub(crate) fn format_modifiers(modifiers: Modifiers) -> String {
+    let mut rem = modifiers;
+    let mut parts = Vec::new();
+    for (mask, name) in [
+        (Modifiers::ALT, "alt"),
+        (Modifiers::LALT, "lalt"),
+        (Modifiers::RALT, "ralt"),
+        (Modifiers::SHIFT, "shift"),
+        (Modifiers::LSHIFT, "lshift"),
+        (Modifiers::RSHIFT, "rshift"),
+        (Modifiers::CMD, "cmd"),
+        (Modifiers::LCMD, "lcmd"),
+        (Modifiers::RCMD, "rcmd"),
+        (Modifiers::CTRL, "ctrl"),
+        (Modifiers::LCTRL, "lctrl"),
+        (Modifiers::RCTRL, "rctrl"),
+        (Modifiers::FN, "fn"),
+    ] {
+        if rem.contains(mask) {
+            parts.push(name);
+            rem.remove(mask);
+        }
+    }
+    parts.join(" + ")
 }
 
 /// Builds a [`Config`] from the Lua table passed to `paneru.setup{...}`,

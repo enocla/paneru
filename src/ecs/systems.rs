@@ -1,6 +1,6 @@
 use bevy::app::AppExit;
 use bevy::ecs::change_detection::{DetectChanges, DetectChangesMut};
-use bevy::ecs::entity::Entity;
+use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::{ChildOf, Children};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
@@ -25,7 +25,7 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{Column, LayoutStrip};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
@@ -83,8 +83,14 @@ type ResizableWindows<'w, 's> = Query<
 
 const ANIAMTE_SNAP_THRESHOLD: f32 = 5.0;
 const LOOP_MAX_TIMEOUT_FRAME_ACTIVE_MS: u32 = 16;
-const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 500;
-const LOOP_MAX_TIMEOUT_MS: u32 = 50;
+const LOOP_MAX_TIMEOUT_LOWPOWER_MS: u32 = 2000;
+// Real events (input, IPC, workspace changes, ...) wake the pump immediately
+// via `EventLoopWaker`, so this only bounds how late the free-running 1s
+// `on_timer` systems (`recover_lost_focus`, workspace refresh) can land, and
+// how long a dead event tap can go unnoticed between the 30s health sweeps.
+// Kept well under both: with no genuine work to do, this used to run the
+// whole schedule 20 times a second.
+const LOOP_MAX_TIMEOUT_MS: u32 = 500;
 const TAP_HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const LOOP_TIMEOUT_STEP: u32 = 1;
 
@@ -500,14 +506,18 @@ pub(super) fn timeout_ticker(
 ) {
     for (entity, mut timeout) in timers {
         if timeout.timer.is_finished() {
-            trace!("Despawning entity {entity} due to timeout.");
             if let Some(system_id) = timeout.system_id.take() {
                 commands.run_system(system_id);
                 commands.unregister_system(system_id);
             }
-            trace!("Removing timer {entity}");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_despawn();
+                if let Some(on_expire) = timeout.on_expire {
+                    trace!("Expiring component timer on {entity}.");
+                    on_expire(&mut entity_commands);
+                } else {
+                    trace!("Despawning entity {entity} due to timeout.");
+                    entity_commands.try_despawn();
+                }
             }
         } else {
             timeout.timer.tick(clock.delta());
@@ -976,6 +986,7 @@ pub(super) struct OverlayWindowConfigCache {
     detected_border_radius: Option<f64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn update_overlays(
     // Gating lives in the `overlay_dirty` run condition (strip change *or*
     // focus change); this query just resolves the current active workspace.
@@ -986,6 +997,7 @@ pub(super) fn update_overlays(
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
     mut window_config_cache: Local<OverlayWindowConfigCache>,
+    window_manager: Res<WindowManager>,
 ) {
     use crate::overlay::BorderParams;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
@@ -1013,19 +1025,30 @@ pub(super) fn update_overlays(
         return;
     }
 
+    let Some((window, entity)) = windows.focused() else {
+        return;
+    };
+    let focused_window_id = window.id();
+    let show_overlay = !window.is_full_screen()
+        && (active_strip.contains(entity)
+            // if the window is floating, check whether it's present in the workspace.
+            || window_manager
+                .windows_in_workspace(active_strip.id())
+                .is_ok_and(|ids| ids.contains(&focused_window_id)));
+
+    if !show_overlay {
+        // No managed window on the active workspace has focus — hide the overlay rather than
+        // dimming everything or drawing a ghost border around an off-screen window.
+        overlay_mgr.hide_all();
+        return;
+    }
+
     // Find the focused managed window's absolute CG frame.
-    // Skip floating/unmanaged windows — no overlay or border for those.
-    let (focused_abs_cg, focused_window_id) = if let Some((window, entity, unmanaged)) = windows
-        .focused()
-        .and_then(|(_, entity)| windows.get_managed(entity))
-        && unmanaged.is_none()
-        && !window.is_full_screen()
-        && active_strip.contains(entity)
-    {
+    let focused_abs_cg = {
         let frame = window.frame();
         let h_pad = window.horizontal_padding();
         let v_pad = window.vertical_padding();
-        let focused_abs_cg = Some(NSRect::new(
+        Some(NSRect::new(
             NSPoint::new(
                 f64::from(frame.min.x + h_pad),
                 f64::from(frame.min.y + v_pad),
@@ -1034,14 +1057,7 @@ pub(super) fn update_overlays(
                 f64::from(frame.width() - 2 * h_pad),
                 f64::from(frame.height() - 2 * v_pad),
             ),
-        ));
-
-        (focused_abs_cg, window.id())
-    } else {
-        // No managed window on the active workspace has focus — hide the overlay rather than
-        // dimming everything or drawing a ghost border around an off-screen window.
-        overlay_mgr.hide_all();
-        return;
+        ))
     };
 
     let border_params = if border_enabled {
@@ -1089,9 +1105,13 @@ pub(super) fn update_overlays(
 pub(super) fn commit_window_position(
     mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
 ) {
+    // `par_iter_mut` runs on `ComputeTaskPool` worker threads, which have no
+    // `CFRunLoop` of their own to drain thread-local autorelease pools.
     moved_windows
         .par_iter_mut()
-        .for_each(|(mut window, position)| window.reposition(position.0));
+        .for_each(|(mut window, position)| {
+            objc2::rc::autoreleasepool(|_| window.reposition(position.0));
+        });
 }
 
 #[instrument(level = Level::TRACE, skip_all)]
@@ -1129,7 +1149,7 @@ pub(super) fn commit_window_size(
         .par_iter_mut()
         .for_each(|(mut window, size, mut width_ratio)| {
             width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
-            window.resize(size.0);
+            objc2::rc::autoreleasepool(|_| window.resize(size.0));
         });
 }
 
@@ -1283,10 +1303,151 @@ pub(crate) fn window_creation_event(mut messages: MessageReader<Event>, mut comm
     }
 }
 
+/// Managed windows whose geometry has settled: nothing in flight, so two of them
+/// sharing a frame really do share it.
+type SettledWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Window,
+        &'static Position,
+        &'static Bounds,
+        &'static ChildOf,
+    ),
+    (
+        Without<Unmanaged>,
+        Without<RepositionMarker>,
+        Without<ResizeMarker>,
+    ),
+>;
+
+/// Whether the app is showing `window_id` right now.
+///
+/// Two signals, because neither alone covers a native tab: the window server
+/// stops listing a window it has ordered out, and an app drops a background tab
+/// from its accessibility list while the window server still calls that tab on
+/// screen. Ghostty does the latter. An empty accessibility list is an app that
+/// did not answer, not an app showing nothing.
+fn app_shows_window(ax_window_ids: &[WinID], on_screen: &[WinID], window_id: WinID) -> bool {
+    on_screen.contains(&window_id)
+        && (ax_window_ids.is_empty() || ax_window_ids.contains(&window_id))
+}
+
+/// Folds a background native tab that ended up in a column of its own back into
+/// the column of the tab that is actually showing.
+///
+/// [`detect_tabbed_windows`] catches this when the tab window is created, but
+/// only when the app has already stopped showing the sibling by then. Ghostty
+/// does not always oblige, and the leftover column is a slot in the strip that
+/// can never show anything: focus lands in it, the strip scrolls to it, and
+/// there is nothing there.
+///
+/// Deliberately narrow. Two managed windows of one app share a frame exactly
+/// only when they share a column, which is what this is repairing, and
+/// [`app_shows_window`] is what tells a background tab from a window the user
+/// can see.
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn regroup_stray_native_tabs(
+    windows: SettledWindows,
+    apps: Query<&Application>,
+    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    window_manager: Res<WindowManager>,
+    mission_control: Res<MissionControlActive>,
+    mut commands: Commands,
+) {
+    if mission_control.0 {
+        return;
+    }
+    let Some(mut strip) = workspaces
+        .iter_mut()
+        .find_map(|(strip, active)| active.then_some(strip))
+    else {
+        return;
+    };
+    let Some(on_screen) = window_manager.windows_on_screen() else {
+        return;
+    };
+
+    // Column tops only: a window sharing a column is already grouped, and
+    // stacked siblings never share a frame.
+    let tops = strip.all_columns();
+    // Only a column of its own can be a stray: pulling a window out of a stack
+    // or an existing tab group would break a grouping the user set up.
+    let strays = strip
+        .columns()
+        .filter_map(|column| match column {
+            Column::Single(entity) => Some(*entity),
+            Column::Stack(_) | Column::Tabs(_) | Column::Fullscren(_) => None,
+        })
+        .collect::<Vec<_>>();
+    // One accessibility round trip per app, not per window: this runs on a timer
+    // and the call crosses into the app.
+    let mut ax_windows: EntityHashMap<Vec<WinID>> = EntityHashMap::default();
+    let columns = tops
+        .into_iter()
+        .filter_map(|entity| windows.get(entity).ok())
+        .map(
+            |(entity, window, Position(position), Bounds(bounds), child)| {
+                let app = child.parent();
+                let ax_window_ids = ax_windows.entry(app).or_insert_with(|| {
+                    apps.get(app)
+                        .map(|app| app.ax_window_ids())
+                        .unwrap_or_default()
+                });
+                (
+                    entity,
+                    app_shows_window(ax_window_ids, &on_screen, window.id()),
+                    *position,
+                    *bounds,
+                    app,
+                )
+            },
+        )
+        .collect::<Vec<_>>();
+
+    let mut regrouped = Vec::new();
+    for (hidden, showing, position, bounds, app) in &columns {
+        if *showing || regrouped.contains(hidden) || !strays.contains(hidden) {
+            continue;
+        }
+        let Some((leader, ..)) = columns.iter().find(
+            |(
+                candidate,
+                candidate_showing,
+                candidate_position,
+                candidate_bounds,
+                candidate_app,
+            )| {
+                *candidate_showing
+                    && candidate != hidden
+                    && candidate_app == app
+                    && candidate_position.chebyshev_distance(*position) <= 1
+                    && candidate_bounds.chebyshev_distance(*bounds) <= 1
+            },
+        ) else {
+            continue;
+        };
+
+        debug!("stray native tab {hidden} folded into the column of {leader}");
+        if strip
+            .convert_to_tabs(*leader, *hidden)
+            .inspect_err(|err| error!("Failed to convert to tabs: {err}"))
+            .is_ok()
+        {
+            regrouped.push(*hidden);
+        }
+    }
+
+    if let Some(leader) = regrouped.first() {
+        commands.reshuffle_around(*leader);
+    }
+}
+
 pub(crate) fn detect_tabbed_windows(
     created: Populated<(Entity, &Position, &Bounds, &ChildOf), Added<Window>>,
     windows: Query<(Entity, &Window, &Position, &Bounds, &ChildOf), With<Window>>,
-    apps: Query<Entity, With<Application>>,
+    apps: Query<(Entity, &Application)>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
     active_display: Single<&Display, With<ActiveDisplayMarker>>,
@@ -1301,7 +1462,7 @@ pub(crate) fn detect_tabbed_windows(
     };
 
     for (entity, Position(position), Bounds(bounds), child) in created {
-        let Ok(app_entity) = apps.get(child.parent()) else {
+        let Ok((app_entity, app)) = apps.get(child.parent()) else {
             continue;
         };
 
@@ -1316,13 +1477,24 @@ pub(crate) fn detect_tabbed_windows(
                     && leader_bounds.chebyshev_distance(*bounds) <= 1
             })
             .collect::<Vec<_>>();
+        if same_size.is_empty() {
+            continue;
+        }
+
+        let on_screen = window_manager.windows_on_screen().unwrap_or_default();
+        let ax_window_ids = app.ax_window_ids();
+        // A leader the app has stopped showing is the tab this one replaced.
+        let hidden_leader = |leader_id| !app_shows_window(&ax_window_ids, &on_screen, leader_id);
 
         // Now check whether any of these found windows have the same position?
         let tabbed = same_size
             .iter()
             .find_map(|(leader, window, Position(leader_position), _, _)| {
-                // If the window has a positional match, it's tabbed!
-                (leader_position.chebyshev_distance(*position) <= 1)
+                // If the window has a positional match, it's tabbed! The hidden
+                // test belongs here rather than after the search: a group the
+                // app is already showing one member of would otherwise be
+                // picked and then rejected, hiding the sibling that matches.
+                (leader_position.chebyshev_distance(*position) <= 1 && hidden_leader(window.id()))
                     .then_some((*leader, window.id()))
             })
             .or_else(|| {
@@ -1342,9 +1514,7 @@ pub(crate) fn detect_tabbed_windows(
             });
 
         if let Some((leader, leader_id)) = tabbed
-            && window_manager
-                .windows_on_screen()
-                .is_some_and(|ids| !ids.contains(&leader_id))
+            && hidden_leader(leader_id)
             && let Some((mut strip, _)) =
                 workspaces.iter_mut().find(|strip| strip.0.contains(leader))
             && strip.contains(leader)

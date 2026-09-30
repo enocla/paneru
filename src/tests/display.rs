@@ -6,7 +6,7 @@ use bevy::time::TimeUpdateStrategy;
 use crate::commands::{Command, Direction, MouseMove, MoveFocus, Operation};
 use crate::config::{Config, MainOptions};
 use crate::ecs::layout::{LayoutStrip, PARKED_STRIP_SLIVER};
-use crate::ecs::{ActiveWorkspaceMarker, DockPosition, RefreshWindowSizes, Timeout};
+use crate::ecs::{DockPosition, Timeout};
 use crate::events::Event;
 use crate::manager::{Display, Origin, Size, Window};
 use crate::platform::WinID;
@@ -449,32 +449,6 @@ fn test_wake_reconciles_unplugged_display() {
                 orphan.expect("external workspace strip should still exist");
             assert!(!has_parent, "orphaned workspace should have no parent");
             assert!(has_timeout, "orphaned workspace should carry a timeout");
-        })
-        .run(commands);
-}
-
-/// Even when the display set is unchanged, waking from sleep must force the
-/// active workspace to re-tile, because macOS relocates window frames across a
-/// sleep/wake cycle.
-#[test]
-fn test_wake_refreshes_active_workspace() {
-    let harness = TestHarness::new().with_windows(1);
-
-    let commands = vec![
-        Event::MenuOpened { window_id: 0 },
-        Event::SystemWoke { msg: String::new() },
-    ];
-
-    harness
-        .on_iteration(1, |world, _state| {
-            let refreshed = world
-                .query_filtered::<Has<RefreshWindowSizes>, With<ActiveWorkspaceMarker>>()
-                .iter(world)
-                .any(|has| has);
-            assert!(
-                refreshed,
-                "wake should mark the active workspace for a window-size refresh"
-            );
         })
         .run(commands);
 }

@@ -204,6 +204,7 @@ pub(super) fn theme_change_trigger(
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `ctx` - Window queries, configuration and the command buffer.
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_lines)]
 pub(super) fn window_focused_trigger(
     mut messages: MessageReader<Event>,
     applications: Query<&Application>,
@@ -214,6 +215,12 @@ pub(super) fn window_focused_trigger(
     mut ctx: WindowCtx,
 ) {
     const STRAY_FOCUS_RETRY_SEC: u64 = 2;
+
+    let initial_focused = ctx
+        .windows
+        .focused()
+        .map(|(window, entity)| (entity, window.id()));
+    let mut current_focused = initial_focused;
 
     for event in messages.read() {
         let Event::WindowFocused { window_id } = *event else {
@@ -235,29 +242,45 @@ pub(super) fn window_focused_trigger(
             continue;
         };
 
+        // Guard against stale focus events: a delayed one (from
+        // RetryFrontSwitch or a dont_focus re-assertion) must not pull
+        // FocusedMarker back after focus has moved to another app.
+        if !app.is_frontmost() {
+            continue;
+        }
+
+        // Within the app, the window it says is focused wins over the id the
+        // event carries, which may be a moment out of date. An app with native
+        // tabs in particular answers with whichever member of the tab group it
+        // decided to show. Follow it to that window rather than dropping the
+        // event: dropping it leaves the strip parked where it was, so Cmd-Tab
+        // into a tabbed terminal looks like nothing happened.
+        let (window, entity, window_id) = match app.focused_window_id() {
+            Ok(current) if current != window_id => {
+                match ctx.windows.find_parent(current) {
+                    Some((current_window, current_entity, current_parent))
+                        if current_parent == parent =>
+                    {
+                        debug!(
+                            "app {} reports window {current} focused, not {window_id}; following it",
+                            app.name()
+                        );
+                        (current_window, current_entity, current)
+                    }
+                    // Nothing we track answers to that id, so the event really
+                    // is stale.
+                    _ => continue,
+                }
+            }
+            _ => (window, entity, window_id),
+        };
+
         // Always keep passthrough in sync. An internal focus_entity call races
         // with the OS WindowFocused event; without this the passthrough keys
         // remain stale from a previously focused window.
         update_passthrough(window, app, &ctx.config);
 
-        let already_focused = ctx
-            .windows
-            .focused()
-            .is_some_and(|(focused, _)| focused.id() == window_id);
-
-        // Guard against stale focus events. Without these checks, delayed
-        // events (e.g. from RetryFrontSwitch or dont_focus re-assertions)
-        // can pull FocusedMarker back to an old window after focus has moved on.
-        //
-        // 1. Cross-app: skip if the window's app is no longer frontmost.
-        // 2. Same-app: skip if the app's current focused window differs from
-        //    this event's window_id (the event is outdated).
-        if !app.is_frontmost() {
-            continue;
-        }
-        if app.focused_window_id().is_ok_and(|id| id != window_id) {
-            continue;
-        }
+        let already_focused = current_focused.is_some_and(|(_, id)| id == window_id);
 
         let managed = ctx
             .windows
@@ -343,10 +366,19 @@ pub(super) fn window_focused_trigger(
             continue;
         }
 
-        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-            entity_commands.try_insert(FocusedMarker);
-            debug!("window {} ({entity}) focused.", window.id());
-        }
+        current_focused = Some((entity, window_id));
+    }
+
+    // Apply `FocusedMarker` at most once for the final target in this frame's
+    // batch: queueing `try_insert(FocusedMarker)` for multiple entities in one
+    // deferred command buffer causes `maintain_focus_singleton` to queue
+    // `try_remove::<FocusedMarker>()` on both of them, stripping focus entirely.
+    if let Some((entity, window_id)) = current_focused
+        && current_focused != initial_focused
+        && let Ok(mut entity_commands) = ctx.commands.get_entity(entity)
+    {
+        entity_commands.try_insert(FocusedMarker);
+        debug!("window {window_id} ({entity}) focused.");
     }
 }
 
@@ -939,6 +971,20 @@ fn give_away_focus(
     config: &mut GlobalState,
     commands: &mut Commands,
 ) {
+    if active_strip.is_tabbed_display(entity)
+        && let Some(sibling) = active_strip.tab_display_sibling(entity)
+    {
+        // Closing/losing focus on the active tab of a paneru-tabbed-display
+        // stack must focus the next tab, not fall through to the
+        // nearest-column search below — that search returns one
+        // representative entity per column, and this column's own entry
+        // was `entity` itself, so it would otherwise jump to an unrelated
+        // neighbouring column.
+        config.set_ffm_flag(None);
+        commands.focus_entity(sibling, true);
+        return;
+    }
+
     if active_strip.tabbed(entity) {
         // Do not give away focus for tabbed windows.
         // Remaining tab gets the focus.

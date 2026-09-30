@@ -5,7 +5,7 @@ use bevy::ecs::entity::{Entity, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::message::MessageReader;
 use bevy::ecs::query::{Has, With, Without};
-use bevy::ecs::system::{Commands, Query, Res, ResMut, Single};
+use bevy::ecs::system::{Commands, Query, Res, Single};
 use bevy::math::IRect;
 use tracing::{Level, instrument};
 use tracing::{debug, error, info};
@@ -102,7 +102,7 @@ pub fn register_commands(app: &mut bevy::app::App) {
     // A default dialect so the mock harness has one; the real app overwrites it
     // once it knows whether a Lua script took over the configuration.
     app.init_resource::<SnippetDialect>();
-    app.add_systems(PreUpdate, copy_window_rule);
+    app.add_systems(PreUpdate, (copy_window_rule, toggle_tabbed_display_handler));
 }
 
 pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
@@ -134,7 +134,7 @@ pub fn filter_window_operations<'a, F: Fn(&Operation) -> bool>(
 ///
 /// `Some(Entity)` with the found window's entity, otherwise `None`.
 #[instrument(level = Level::DEBUG, ret)]
-fn get_window_in_direction(
+pub(crate) fn get_window_in_direction(
     direction: &Direction,
     entity: Entity,
     strip: &LayoutStrip,
@@ -260,13 +260,30 @@ fn nearest_float_in_direction(
 /// # Returns
 ///
 /// `Some(Entity)` with the entity of the newly focused window, otherwise `None`.
+fn focus_with_verification(
+    entity: Entity,
+    focused_entity: Option<Entity>,
+    commands: &mut Commands,
+) {
+    if focused_entity != Some(entity)
+        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    {
+        entity_commands.try_insert((
+            crate::ecs::VerifyFocus,
+            Timeout::for_component::<crate::ecs::VerifyFocus>(
+                crate::ecs::focus::VERIFY_FOCUS_TIMEOUT,
+            ),
+        ));
+    }
+    commands.focus_entity(entity, true);
+}
+
 fn command_move_focus(
     mut messages: MessageReader<Event>,
     windows: Windows,
     workspaces: Query<(&LayoutStrip, Entity, Option<&NativeFullscreenMarker>)>,
     active_display: ActiveDisplay,
     window_manager: Res<WindowManager>,
-    mut focus_history: ResMut<FocusHistory>,
     mut commands: Commands,
 ) {
     let Some(Operation::Focus(direction)) =
@@ -296,8 +313,7 @@ fn command_move_focus(
 
         if let Some(entity) = strip.and_then(|strip| strip.last().ok().and_then(|col| col.top())) {
             debug!("fullscreen: swap raising {entity}");
-            focus_history.pending_focus = Some(entity);
-            commands.focus_entity(entity, true);
+            focus_with_verification(entity, windows.focused().map(|(_, e)| e), &mut commands);
         }
         return;
     }
@@ -317,8 +333,7 @@ fn command_move_focus(
             active_strip.id(),
             active_display.bounds(),
         ) {
-            focus_history.pending_focus = Some(entity);
-            commands.focus_entity(entity, true);
+            focus_with_verification(entity, Some(focused_entity), &mut commands);
         }
         return;
     }
@@ -359,8 +374,7 @@ fn command_move_focus(
     };
 
     if let Some(entity) = candidate {
-        focus_history.pending_focus = Some(entity);
-        commands.focus_entity(entity, true);
+        focus_with_verification(entity, Some(focused_entity), &mut commands);
         // Explicitly reshuffle so the target window is brought into view.
         // This avoids a race where focus-follows-mouse leaves skip_reshuffle
         // set, causing the WindowFocused handler to skip the reshuffle.
@@ -1443,6 +1457,46 @@ pub fn stack_windows_handler(
         // edge-clamp in reshuffle_layout_strip keeps the strip pinned so the
         // leftmost window touches the left edge and the rightmost the right.
         commands.reshuffle_around(entity);
+    }
+}
+
+/// Toggles the focused window's stack between a normal split display and a
+/// tabbed display (one window visible at a time, sharing the full column
+/// rect — cycle with the existing `Focus` North/South directions). A no-op
+/// on anything that isn't a multi-window `Column::Stack`.
+#[instrument(level = Level::DEBUG, skip_all)]
+pub fn toggle_tabbed_display_handler(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    mut active_display: ActiveDisplayMut,
+    mut commands: Commands,
+) {
+    if filter_window_operations(&mut messages, |op| {
+        matches!(op, Operation::ToggleTabbedDisplay)
+    })
+    .next()
+    .is_none()
+    {
+        return;
+    }
+
+    if let Some((_, entity, unmanaged)) = windows
+        .focused()
+        .and_then(|(_, entity)| windows.get_managed(entity))
+        && unmanaged.is_none()
+    {
+        let strip = active_display.active_strip();
+        // `None` means the toggle wasn't applicable (not in a multi-window
+        // Stack) — stay silent rather than reporting it the same way as a
+        // real "turned tabs off", which previously made repeated presses on
+        // a non-stacked window look like a stuck toggle.
+        if let Some(now_tabbed) = strip.toggle_tabbed_display(entity) {
+            commands.reshuffle_around(entity);
+            commands.flash_message(
+                if now_tabbed { "Tabs on" } else { "Tabs off" }.to_string(),
+                1.0,
+            );
+        }
     }
 }
 

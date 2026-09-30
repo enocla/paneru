@@ -19,8 +19,7 @@ use tracing::{Level, debug, error, instrument, warn};
 use crate::config::Config;
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::{
-    ActiveDisplayMarker, ActiveWorkspaceMarker, ReadDisplayProperties, RefreshWindowSizes,
-    SendMessageTrigger, SpawnCommandsExt, Timeout,
+    ActiveDisplayMarker, ReadDisplayProperties, SendMessageTrigger, SpawnCommandsExt, Timeout,
 };
 use crate::events::Event;
 use crate::manager::{Display, WindowManager, irect_from};
@@ -103,7 +102,6 @@ pub(crate) fn reconcile_displays(
     mut messages: MessageReader<Event>,
     workspaces: Query<(&LayoutStrip, Entity, Option<&ChildOf>)>,
     mut displays: Query<(&mut Display, Entity)>,
-    active_strips: Query<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>,
     window_manager: Res<WindowManager>,
     mut retries: Local<u8>,
     mut commands: Commands,
@@ -189,14 +187,6 @@ pub(crate) fn reconcile_displays(
             &workspaces,
             &mut commands,
         );
-    }
-
-    // Re-tile the active workspace even when the topology is unchanged — the OS
-    // shuffles window frames across a sleep/wake cycle.
-    for entity in active_strips {
-        if let Ok(mut cmd) = commands.get_entity(entity) {
-            cmd.insert(RefreshWindowSizes::default());
-        }
     }
 
     commands.trigger(SendMessageTrigger(Event::DisplayChanged));
@@ -328,8 +318,6 @@ fn reparent_existing_workspaces(
                         cmd.try_remove::<Timeout>()
                             .try_remove::<ChildOf>()
                             .try_insert(ChildOf(display_entity));
-
-                        cmd.try_insert(RefreshWindowSizes::default());
                     }
                 }
             }
